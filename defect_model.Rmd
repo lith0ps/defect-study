@@ -1,0 +1,319 @@
+---
+title: "recreation of: An Empirical Study of Model-Agnostic Techniques for Defect Prediction Models"
+output: html_notebook
+---
+
+```{r}
+library(Rnalytica)
+library(tidyverse)
+library(tidymodels)
+library(lime)
+library(DALEX)
+```
+
+# data
+
+```{r}
+defects <- loadDefectDataset('activemq-5.0.0', 'jira')
+data <- defects$data %>% drop_na()
+```
+
+Split. 
+
+```{r}
+set.seed(123)
+
+data_split <- initial_split(data, strata = RealBug)
+data_train <- training(data_split)
+data_test <- testing(data_split)
+```
+
+
+```{r}
+first_sample <- select(data_test, -RealBug) %>% slice(1)
+first_sample
+```
+
+```{r}
+second_sample <- select(data_test, -RealBug) %>% slice(2)
+second_sample
+```
+
+Bootstrap resamples.
+
+```{r}
+set.seed(123)
+
+folds <- bootstraps(data_train, strata = RealBug, apparent = FALSE, times = 100)
+```
+
+
+# formula construction
+
+Independent variables should be the same for each dataset.
+
+```{r}
+indep <- defects$indep
+indep
+```
+
+Paper mentions using AutoSpearman to pick non-correlated features. 
+
+```{r}
+features <- AutoSpearman(dataset = data, metrics = indep)
+
+features
+```
+
+```{r}
+formula <- RealBug ~ CountDeclMethodPrivate + CountDeclMethodDefault + AvgEssential + CountDeclClassVariable + CountDeclClassMethod + AvgLineComment + AvgCyclomaticModified + CountDeclClass +
+  CountDeclMethodProtected + CountDeclInstanceVariable + RatioCommentToCode + AvgLineBlank + PercentLackOfCohesion + PercentLackOfCohesion + MaxInheritanceTree + CountClassDerived + CountClassCoupled + 
+  CountClassBase + CountInput_Mean + CountInput_Min + CountOutput_Mean + CountOutput_Min + CountPath_Min + MaxNesting_Min + OWN_COMMIT + MINOR_COMMIT + MINOR_LINE + MAJOR_LINE
+```
+
+```{r}
+rec <- recipe(formula, data_train)
+```
+
+
+# random forest model
+
+## workflow
+
+```{r}
+rf_mod <-
+  rand_forest(trees = 64) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+```
+
+```{r}
+rf_wf <- 
+  workflow() %>% 
+  add_model(rf_mod) %>%
+  add_recipe(rec)
+```
+
+## fit resample
+
+```{r}
+set.seed(123)
+rf_fit_rs <- 
+  rf_wf %>%
+  fit_resamples(folds)
+```
+
+ 
+```{r}
+collect_metrics(rf_fit_rs)
+```
+
+The resample suggests that the model is a good classifier. 
+
+## fit model
+
+Create the model normally. The type flag gives the probabilities for each class: "TRUE" or "FALSE".
+
+```{r}
+rf_fit <- fit(rf_wf, data=data_train)
+rf_pred <- predict(rf_fit, data_test, type = 'prob')
+```
+
+## prediction metrics
+
+```{r}
+rf_pred <- bind_cols(truth=data_test$RealBug, rf_pred)
+rf_pred
+```
+
+```{r}
+roc_curve(
+  rf_pred,
+  truth,
+  .pred_TRUE,
+  event_level = "second"
+) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw()
+```
+
+ROC curve shows that our model does an alright job in its predictions. The curve is similar to the roc_auc value we found while resampling. 
+
+
+## explainations
+
+```{r}
+model <- extract_fit_parsnip(rf_fit)
+```
+
+### lime explaination
+
+```{r}
+explainer <- lime(select(data_train, -RealBug), model, bin_continuous = TRUE, quantile_bins = FALSE)
+
+first_explaination <- lime::explain(first_sample, explainer=explainer, n_features = 5, n_labels=2)
+
+first_explaination
+```
+
+
+```{r}
+plot_features(first_explaination)
+```
+
+```{r}
+second_explaination <- lime::explain(second_sample, explainer=explainer, n_features = 5, n_labels=2)
+
+second_explaination
+```
+
+```{r}
+plot_features(second_explaination)
+```
+
+Although only slightly, the explanations between two samples ARE different. Compare CountClassCoupled between the LIME explainners. 
+
+### breakdown explanation
+
+Breakdown of the first sample:
+
+```{r}
+DALEX::explain(model, data = select(data_train, -RealBug), y = data_train$RealBug) %>%
+  predict_parts(new_observation = first_sample, type = "break_down") %>% 
+  plot()
+```
+
+Breakdown of the second sample:
+
+```{r}
+DALEX::explain(model, data = select(data_train, -RealBug), y = data_train$RealBug) %>%
+  predict_parts(new_observation = second_sample, type = "break_down") %>% 
+  plot()
+```
+
+# logistic model
+
+## workflow
+
+```{r}
+log_mod <-
+  logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+```
+
+```{r}
+rf_wf <- 
+  workflow() %>% 
+  add_model(log_mod) %>%
+  add_recipe(rec)
+```
+
+## fit resample
+
+```{r}
+set.seed(123)
+rf_fit_rs <- 
+  rf_wf %>%
+  fit_resamples(folds)
+```
+
+ 
+```{r}
+collect_metrics(rf_fit_rs)
+```
+
+
+## fit model
+
+
+```{r}
+rf_fit <- fit(rf_wf, data=data_train)
+rf_pred <- predict(rf_fit, data_test, type = 'prob')
+```
+
+## prediction metrics
+
+```{r}
+rf_pred <- bind_cols(truth=data_test$RealBug, rf_pred)
+rf_pred
+```
+
+```{r}
+roc_curve(
+  rf_pred,
+  truth,
+  .pred_TRUE,
+  event_level = "second"
+) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw()
+```
+
+## explainations
+
+```{r}
+model <- extract_fit_parsnip(rf_fit)
+```
+
+### lime explaination
+
+```{r}
+explainer <- lime(select(data_train, -RealBug), model, bin_continuous = TRUE, quantile_bins = FALSE)
+
+first_explaination <- lime::explain(first_sample, explainer=explainer, n_features = 5, n_labels=2)
+
+first_explaination
+```
+
+
+```{r}
+plot_features(first_explaination)
+```
+
+```{r}
+second_explaination <- lime::explain(second_sample, explainer=explainer, n_features = 5, n_labels=2)
+
+second_explaination
+```
+
+```{r}
+plot_features(second_explaination)
+```
+
+Although only slightly, the explanations between two samples ARE different. Compare CountClassCoupled between the LIME explainners. 
+
+### breakdown explanation
+
+Breakdown of the first sample:
+
+```{r}
+DALEX::explain(model, data = select(data_train, -RealBug), y = data_train$RealBug) %>%
+  predict_parts(new_observation = first_sample, type = "break_down") %>% 
+  plot()
+```
+
+Breakdown of the second sample:
+
+```{r}
+DALEX::explain(model, data = select(data_train, -RealBug), y = data_train$RealBug) %>%
+  predict_parts(new_observation = second_sample, type = "break_down") %>% 
+  plot()
+```
+
+
+# reference
+ 
+https://rsample.tidymodels.org/reference/bootstraps.html
+https://www.tidymodels.org/start/resampling/
+https://yardstick.tidymodels.org/reference/roc_curve.html
+https://medium.com/responsibleml/basic-xai-with-dalex-part-6-lime-method-f6aab0af058a
+https://yardstick.tidymodels.org/reference/roc_curve.html
+https://workflows.tidymodels.org/reference/extract-workflow.html
+https://github.com/awsm-research/Rnalytica
